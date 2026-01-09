@@ -2,31 +2,38 @@
 Dashboard de Ventas (Práctica Streamlit)
 
 Este script construye un dashboard interactivo en Streamlit para analizar ventas.
-Incluye 4 pestañas (según el enunciado) y añade extras "executive-ready":
-- Estilo visual (turquesa + naranja suave) y tipografía.
-- Gráficos con contexto (micro-narrativa) para que se entiendan rápido.
-- Animación con Plotly (top productos por año).
-- Comparador (Store A vs Store B) en la pestaña 4.
+Incluye 4 pestañas (según el enunciado) y añade extras “executive-ready”:
+- Estilo visual (turquesa + naranja suave) y tipografía (Inter).
+- Contexto bajo cada gráfico (micro-narrativa: cómo leerlo).
+- Animación Plotly (Top productos por año).
+- Comparador (Tienda A vs Tienda B) en la pestaña 4.
+- Carga robusta de datos:
+    * Opción 1: si tienes parte_1.zip y parte_2.zip en la raíz del repo (GitHub), los descomprime a /data.
+    * Opción 2 (fallback): si no están, los descarga desde tus URLs de GitHub Releases y hace lo mismo.
 
-Cómo ejecutar:
-    python -m streamlit run app.py
+Cómo ejecutar en local:
+    pip install -r requirements.txt
+    streamlit run app.py
 """
 
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
+
+import io
+import zipfile
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
+import requests
+import streamlit as st
 
 # ============================================================
-# THEME (turquesa + naranja suave) + tipografía
+# CONFIG / THEME (turquesa + naranja suave)
 # ============================================================
 ACCENT_TURQ = "#1FB6AA"
 ACCENT_ORANGE = "#FFB168"
 ACCENT_DARK = "#0B1320"
-ACCENT_MID = "#1A2639"
-
-ZIP_URL_1 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_1.zip"
-ZIP_URL_2 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_2.zip"
 
 px.defaults.template = "plotly_white"
 px.defaults.color_discrete_sequence = [
@@ -40,13 +47,22 @@ px.defaults.color_discrete_sequence = [
 
 st.set_page_config(page_title="Dashboard Ventas", page_icon="📊", layout="wide")
 
-# Estilo general + "idea 10": look más limpio tipo web (ocultar menú/footer, etc.)
+# ============================================================
+# IMPORTANT: URLs (fallback) por si NO subes los ZIP al repo
+# (Si ya tienes parte_1.zip y parte_2.zip en el repo, no hace falta que descargue nada)
+# ============================================================
+ZIP_URL_1 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_1.zip"
+ZIP_URL_2 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_2.zip"
+
+# ============================================================
+# CSS (look tipo web-app) + tipografía + detalles
+# ============================================================
 st.markdown(
     f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
 
-/* Ocultar elementos "marca Streamlit" para que parezca más web-app (idea 10) */
+/* Quitar "cosas Streamlit" para que parezca más web */
 #MainMenu {{visibility: hidden;}}
 footer {{visibility: hidden;}}
 header {{visibility: hidden;}}
@@ -114,7 +130,6 @@ hr {{
   border-top: 1px solid rgba(11, 19, 32, 0.08);
 }}
 
-/* Tabs un poco más "card" */
 div[data-testid="stTabs"] button {{
   border-radius: 12px !important;
   padding: 10px 14px !important;
@@ -125,11 +140,16 @@ div[data-testid="stTabs"] button {{
 )
 
 
-def fmt_short(x: float) -> str:
+def fmt_short(x: float | int | None) -> str:
     """Formatea números grandes a formato compacto: 1.2k / 3.4M / 5.6B."""
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    if x is None:
         return "—"
-    x = float(x)
+    try:
+        x = float(x)
+    except Exception:
+        return "—"
+    if np.isnan(x):
+        return "—"
     ax = abs(x)
     if ax >= 1e9:
         return f"{x/1e9:.1f}B"
@@ -140,8 +160,8 @@ def fmt_short(x: float) -> str:
     return f"{x:.0f}"
 
 
-def apply_plot_style(fig, x_title=None, y_title=None):
-    """Aplica un estilo consistente para que todos los gráficos respiren igual."""
+def apply_plot_style(fig, x_title: str | None = None, y_title: str | None = None):
+    """Aplica un estilo consistente (márgenes + tipografía) para que todo se vea uniforme."""
     fig.update_layout(
         font=dict(family="Inter"),
         title=dict(font=dict(size=20)),
@@ -155,70 +175,94 @@ def apply_plot_style(fig, x_title=None, y_title=None):
 
 
 # ============================================================
-# LOAD DATA
+# DATA LOADING (ZIP local -> /data | fallback: descargar desde Releases)
 # ============================================================
-from pathlib import Path
-from io import BytesIO
-import zipfile
-import requests
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-@st.cache_data(show_spinner=True)
-def _download_and_extract_csv(zip_url: str, out_csv_name: str) -> Path:
-    """
-    Descarga un ZIP desde GitHub Releases y extrae el primer CSV que encuentre.
-    Devuelve la ruta local del CSV extraído.
-    """
-    out_csv = DATA_DIR / out_csv_name
-    if out_csv.exists():
-        return out_csv
+ZIP_LOCAL_1 = Path("parte_1.zip")  # si lo subiste al repo (raíz)
+ZIP_LOCAL_2 = Path("parte_2.zip")
 
-    # Descarga robusta (GitHub a veces redirige)
-    r = requests.get(zip_url, allow_redirects=True, timeout=180)
+CSV_1 = DATA_DIR / "parte_1.csv"
+CSV_2 = DATA_DIR / "parte_2.csv"
+
+
+def _download_zip(url: str) -> bytes:
+    """Descarga un ZIP (bytes)."""
+    r = requests.get(url, timeout=60)
     r.raise_for_status()
+    return r.content
 
-    with zipfile.ZipFile(BytesIO(r.content)) as z:
-        csv_members = [m for m in z.namelist() if m.lower().endswith(".csv")]
-        if not csv_members:
-            raise ValueError(f"No hay ningún CSV dentro del ZIP: {zip_url}")
-        member = csv_members[0]
 
-        with z.open(member) as f_in, open(out_csv, "wb") as f_out:
-            f_out.write(f_in.read())
+def _extract_zip_bytes(zip_bytes: bytes, dest_dir: Path) -> None:
+    """Extrae el ZIP (en memoria) a dest_dir."""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        z.extractall(dest_dir)
 
-    return out_csv
+
+def _extract_zip_file(zip_path: Path, dest_dir: Path) -> None:
+    """Extrae el ZIP (archivo) a dest_dir."""
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(dest_dir)
+
+
+def ensure_csvs_exist() -> None:
+    """
+    Garantiza que existan data/parte_1.csv y data/parte_2.csv.
+    1) Si ya existen -> no hace nada.
+    2) Si existen ZIPs en la raíz -> extrae.
+    3) Si no existen -> descarga desde GitHub Releases (URLs) y extrae.
+    """
+    # Si ya están, perfecto.
+    if CSV_1.exists() and CSV_2.exists():
+        return
+
+    # OJO: esto se ejecuta tanto en local como en Streamlit Cloud.
+    # Truco: extraer solo lo que falta.
+    if (not CSV_1.exists()) and ZIP_LOCAL_1.exists():
+        _extract_zip_file(ZIP_LOCAL_1, DATA_DIR)
+
+    if (not CSV_2.exists()) and ZIP_LOCAL_2.exists():
+        _extract_zip_file(ZIP_LOCAL_2, DATA_DIR)
+
+    # Si sigue faltando algo -> fallback: descargar desde Releases
+    if not CSV_1.exists():
+        zip_bytes = _download_zip(ZIP_URL_1)
+        _extract_zip_bytes(zip_bytes, DATA_DIR)
+
+    if not CSV_2.exists():
+        zip_bytes = _download_zip(ZIP_URL_2)
+        _extract_zip_bytes(zip_bytes, DATA_DIR)
 
 
 @st.cache_data(show_spinner=True)
-def load_data():
-    """
-    Carga datos desde los ZIP de Releases (v1), prepara tipos y columnas derivadas.
-    """
-    # Mensajes de “debug” para Streamlit Cloud (se ven en la app)
-    st.info("📥 Descargando y extrayendo datos desde GitHub Releases...")
+def load_data() -> pd.DataFrame | None:
+    """Carga datos, arregla tipos y crea columnas derivadas (year/month/week/day_of_week)."""
+    ensure_csvs_exist()
 
-    csv1 = _download_and_extract_csv(ZIP_URL_1, "parte_1.csv")
-    st.success(f"✅ Extraído: {csv1}")
+    if not CSV_1.exists() or not CSV_2.exists():
+        st.error("No he podido encontrar/crear parte_1.csv y parte_2.csv en /data.")
+        return None
 
-    csv2 = _download_and_extract_csv(ZIP_URL_2, "parte_2.csv")
-    st.success(f"✅ Extraído: {csv2}")
-
-    st.info("📄 Leyendo CSVs (esto puede tardar un poco)...")
-
-    df1 = pd.read_csv(csv1, low_memory=False)
-    df2 = pd.read_csv(csv2, low_memory=False)
+    # low_memory=False evita warnings de tipos mezclados y suele ir mejor en cloud
+    df1 = pd.read_csv(CSV_1, low_memory=False)
+    df2 = pd.read_csv(CSV_2, low_memory=False)
 
     # Si tienen mismas columnas -> concat
     if set(df1.columns) == set(df2.columns):
         df = pd.concat([df1, df2], ignore_index=True)
     else:
+        # Si no coinciden, intentamos con columnas comunes
         common_cols = list(set(df1.columns).intersection(set(df2.columns)))
         if common_cols:
             df = pd.concat([df1[common_cols], df2[common_cols]], ignore_index=True)
+            st.warning(
+                "⚠️ parte_1 y parte_2 NO tienen las mismas columnas. "
+                "He concatenado solo las columnas comunes."
+            )
         else:
-            raise ValueError("No hay columnas comunes entre parte_1 y parte_2.")
+            st.error("❌ No hay columnas comunes entre parte_1 y parte_2.")
+            return None
 
     # Tipos básicos
     if "date" in df.columns:
@@ -244,9 +288,7 @@ def load_data():
         if "day_of_week" not in df.columns:
             df["day_of_week"] = df["date"].dt.day_name()
 
-    st.success("✅ Datos cargados correctamente.")
     return df
-
 
 
 df = load_data()
@@ -282,7 +324,7 @@ if "year" in df_f.columns:
 
 st.sidebar.write("")
 st.sidebar.markdown(
-    "<div class='small-note'>Tip: usa los filtros para que rankings y medias sean coherentes.</div>",
+    "<div class='small-note'>Tip: usa filtros para que rankings y medias sean coherentes.</div>",
     unsafe_allow_html=True,
 )
 
@@ -298,19 +340,13 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 st.caption("Producto = family · Ventas en promoción = registros con onpromotion > 0")
 
 # ============================================================
 # TABS
 # ============================================================
 tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "1️⃣ Vista Global",
-        "2️⃣ Por Tienda",
-        "3️⃣ Por Estado",
-        "4️⃣ Insights Extra",
-    ]
+    ["1️⃣ Vista Global", "2️⃣ Por Tienda", "3️⃣ Por Estado", "4️⃣ Insights Extra"]
 )
 
 # ============================================================
@@ -319,7 +355,6 @@ tab1, tab2, tab3, tab4 = st.tabs(
 with tab1:
     st.header("1️⃣ Vista Global")
 
-    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Número total de tiendas", df_f["store_nbr"].nunique() if "store_nbr" in df_f.columns else "N/A")
     c2.metric("Número total de productos", df_f["family"].nunique() if "family" in df_f.columns else "N/A")
@@ -327,20 +362,18 @@ with tab1:
     c4.metric("Meses con datos", df_f["date"].dt.to_period("M").nunique() if "date" in df_f.columns else "N/A")
 
     st.markdown(
-        "<div class='small-note'>📌 Estos KPIs te dicen el tamaño del negocio y el alcance temporal del dataset.</div>",
+        "<div class='small-note'>📌 KPIs para entender tamaño del negocio y cobertura temporal del dataset.</div>",
         unsafe_allow_html=True,
     )
-
     st.divider()
 
-    # Top 10 productos (global)
+    # Top 10 productos
     if "family" in df_f.columns and "sales" in df_f.columns:
         st.subheader("Top productos")
         st.markdown(
             "<div class='small-note'>Cómo leerlo: ranking global de familias por ventas (útil para priorizar surtido).</div>",
             unsafe_allow_html=True,
         )
-
         top_products = (
             df_f.groupby("family", as_index=False)["sales"].sum()
             .sort_values("sales", ascending=False)
@@ -356,52 +389,52 @@ with tab1:
         )
         fig.update_xaxes(tickformat=".2s")
         apply_plot_style(fig, x_title="Ventas", y_title="Producto (family)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # Distribución por tienda (ECDF + Box)
     if "store_nbr" in df_f.columns and "sales" in df_f.columns:
         st.subheader("Distribución de ventas por tienda")
         st.markdown(
-            "<div class='small-note'>Cómo leerlo: ECDF muestra qué % de tiendas está por debajo de X ventas; el boxplot resume outliers.</div>",
+            "<div class='small-note'>Cómo leerlo: aquí NO es “un gráfico por tienda”. Se agrupa por tienda y se ve la DISTRIBUCIÓN del conjunto de tiendas (desigualdad + outliers).</div>",
             unsafe_allow_html=True,
         )
 
-        # Agrupamos por tienda para comparar “tiendas” (no registros).
+        # Importantísimo: primero sumamos ventas por tienda (cada tienda = 1 punto)
         sales_by_store = df_f.groupby("store_nbr", as_index=False)["sales"].sum()
+
         colA, colB = st.columns(2)
 
         with colA:
             fig = px.ecdf(
                 sales_by_store,
                 x="sales",
-                title="Distribución (ECDF)",
+                title="Distribución (ECDF) — % tiendas por debajo de X",
                 markers=False,
                 color_discrete_sequence=[ACCENT_TURQ],
             )
             fig.update_xaxes(tickformat=".2s")
             apply_plot_style(fig, x_title="Ventas totales por tienda", y_title="% acumulado de tiendas")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with colB:
             fig = px.box(
                 sales_by_store,
                 y="sales",
                 points="all",
-                title="Resumen (Boxplot + puntos)",
+                title="Resumen (Boxplot + puntos) — detectar outliers",
                 color_discrete_sequence=[ACCENT_ORANGE],
             )
             fig.update_yaxes(tickformat=".2s")
             apply_plot_style(fig, y_title="Ventas totales por tienda")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     # Top 10 tiendas promo
     if "store_nbr" in df_f.columns and "sales" in df_f.columns and "onpromotion" in df_f.columns:
         st.subheader("Promociones")
         st.markdown(
-            "<div class='small-note'>Cómo leerlo: tiendas donde las promociones generan más ventas totales (potenciales 'best practices').</div>",
+            "<div class='small-note'>Cómo leerlo: tiendas donde las promociones aportan más ventas (posibles 'best practices').</div>",
             unsafe_allow_html=True,
         )
-
         promo = df_f[df_f["onpromotion"] > 0]
         top_stores_promo = (
             promo.groupby("store_nbr", as_index=False)["sales"].sum()
@@ -417,18 +450,17 @@ with tab1:
         )
         fig.update_yaxes(tickformat=".2s")
         apply_plot_style(fig, x_title="Tienda", y_title="Ventas en promo")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.divider()
 
-    # Día de la semana con etiquetas encima
+    # Día de la semana
     if "day_of_week" in df_f.columns and "sales" in df_f.columns:
         st.subheader("Estacionalidad semanal")
         st.markdown(
-            "<div class='small-note'>Cómo leerlo: ventas medias por día (útil para planificar personal/stock).</div>",
+            "<div class='small-note'>Cómo leerlo: ventas medias por día (sirve para planificar personal/stock).</div>",
             unsafe_allow_html=True,
         )
-
         order_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         dow = df_f.groupby("day_of_week", as_index=False)["sales"].mean()
 
@@ -443,7 +475,7 @@ with tab1:
         )
         fig.update_traces(texttemplate="%{text:.0f}", textposition="outside", cliponaxis=False)
         apply_plot_style(fig, x_title="Día", y_title="Ventas medias")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # Ventas medias por semana
     if "year" in df_f.columns and "week" in df_f.columns and "sales" in df_f.columns:
@@ -452,7 +484,6 @@ with tab1:
             "<div class='small-note'>Cómo leerlo: compara patrones por año y detecta picos recurrentes.</div>",
             unsafe_allow_html=True,
         )
-
         weekly = df_f.groupby(["year", "week"], as_index=False)["sales"].mean()
         fig = px.line(
             weekly,
@@ -463,7 +494,7 @@ with tab1:
         )
         fig.update_yaxes(tickformat=".2s")
         apply_plot_style(fig, x_title="Semana", y_title="Ventas medias")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # Ventas medias por mes
     if "year" in df_f.columns and "month" in df_f.columns and "sales" in df_f.columns:
@@ -472,7 +503,6 @@ with tab1:
             "<div class='small-note'>Cómo leerlo: visión mensual para campañas y previsión (se ve rápido la estacionalidad).</div>",
             unsafe_allow_html=True,
         )
-
         monthly = df_f.groupby(["year", "month"], as_index=False)["sales"].mean()
         fig = px.line(
             monthly,
@@ -484,7 +514,7 @@ with tab1:
         )
         fig.update_yaxes(tickformat=".2s")
         apply_plot_style(fig, x_title="Mes", y_title="Ventas medias")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 # ============================================================
 # TAB 2
@@ -492,7 +522,7 @@ with tab1:
 with tab2:
     st.header("2️⃣ Por Tienda (store_nbr)")
     st.markdown(
-        "<div class='small-note'>📌 Esta pestaña sirve para entender el rendimiento de una tienda concreta.</div>",
+        "<div class='small-note'>📌 Pestaña para analizar el rendimiento de una tienda concreta.</div>",
         unsafe_allow_html=True,
     )
 
@@ -504,7 +534,6 @@ with tab2:
 
         sdf = df_f[df_f["store_nbr"] == store_sel].copy()
 
-        # a) ventas por año
         if "year" in sdf.columns and "sales" in sdf.columns:
             sales_year = sdf.groupby("year", as_index=False)["sales"].sum().sort_values("year")
             sales_year["year"] = sales_year["year"].astype(int)
@@ -521,16 +550,13 @@ with tab2:
             fig.update_xaxes(tickmode="linear", dtick=1)
             fig.update_yaxes(tickformat=".2s")
             apply_plot_style(fig, x_title="Año", y_title="Ventas")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
-        # b) productos vendidos (familias con ventas)
         prod_count = (
             sdf.loc[sdf["sales"] > 0, "family"].nunique()
             if ("family" in sdf.columns and "sales" in sdf.columns)
             else None
         )
-
-        # c) productos vendidos en promo
         prod_promo = (
             sdf.loc[(sdf["sales"] > 0) & (sdf["onpromotion"] > 0), "family"].nunique()
             if ("family" in sdf.columns and "sales" in sdf.columns and "onpromotion" in sdf.columns)
@@ -547,7 +573,7 @@ with tab2:
 with tab3:
     st.header("3️⃣ Por Estado (state)")
     st.markdown(
-        "<div class='small-note'>📌 Esta pestaña permite revisar rendimiento regional (transacciones, top tiendas y top familias).</div>",
+        "<div class='small-note'>📌 Rendimiento regional: transacciones, top tiendas y top familias.</div>",
         unsafe_allow_html=True,
     )
 
@@ -559,14 +585,14 @@ with tab3:
 
         edf = df_f[df_f["state"] == state_sel].copy()
 
-        # a) transacciones por año (etiquetas + eje X entero)
+        # Transacciones por año
         if "transactions" in edf.columns and "year" in edf.columns:
             tx_year = edf.groupby("year", as_index=False)["transactions"].sum().sort_values("year")
             tx_year["year"] = tx_year["year"].astype(int)
             tx_year["tx_label"] = tx_year["transactions"].apply(lambda v: f"{v/1e6:.1f}M")
 
             st.markdown(
-                "<div class='small-note'>Cómo leerlo: volumen de actividad (transacciones) por año para el estado seleccionado.</div>",
+                "<div class='small-note'>Cómo leerlo: volumen de actividad (transacciones) por año en el estado.</div>",
                 unsafe_allow_html=True,
             )
 
@@ -583,17 +609,16 @@ with tab3:
             fig.update_xaxes(tickmode="linear", dtick=1)
             fig.update_yaxes(tickformat=".2s")
             apply_plot_style(fig, x_title="Año", y_title="Transacciones")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("No encuentro 'transactions' o 'year' para el gráfico de transacciones por año.")
 
-        # b) ranking tiendas con más ventas
+        # Top tiendas por ventas
         if "store_nbr" in edf.columns and "sales" in edf.columns:
             st.markdown(
-                "<div class='small-note'>Cómo leerlo: ranking de tiendas dentro del estado. Útil para detectar 'top performers'.</div>",
+                "<div class='small-note'>Cómo leerlo: ranking de tiendas dentro del estado (top performers).</div>",
                 unsafe_allow_html=True,
             )
-
             top_state_stores = (
                 edf.groupby("store_nbr", as_index=False)["sales"].sum()
                 .sort_values("sales", ascending=False)
@@ -608,12 +633,11 @@ with tab3:
             )
             fig.update_yaxes(tickformat=".2s")
             apply_plot_style(fig, x_title="Tienda", y_title="Ventas")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
-        # c) producto más vendido + top 5
+        # Top producto + Top 5
         if "family" in edf.columns and "sales" in edf.columns:
             fam_state = edf.groupby("family", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
-
             if len(fam_state):
                 top1 = fam_state.iloc[0]
                 st.success(
@@ -621,7 +645,7 @@ with tab3:
                 )
 
                 st.markdown(
-                    "<div class='small-note'>Nota: si ves que siempre gana <b>GROCERY I</b>, suele ser normal porque agrupa muchos básicos.</div>",
+                    "<div class='small-note'>Nota: si aparece mucho <b>GROCERY I</b>, suele ser normal (agrupa básicos).</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -638,19 +662,18 @@ with tab3:
                 fig.update_traces(texttemplate="%{text:.2s}", textposition="outside", cliponaxis=False)
                 fig.update_xaxes(tickformat=".2s")
                 apply_plot_style(fig, x_title="Ventas", y_title="Producto (family)")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
 # ============================================================
-# TAB 4 (innovación: animación + comparador + narrativa)
+# TAB 4 (Innovación: animación + comparador + micro-insights)
 # ============================================================
 with tab4:
     st.header("4️⃣ Insights Extra (para sorprender)")
     st.markdown(
-        "<div class='small-note'>Aquí añadimos funcionalidades más 'dashboard': animaciones, comparadores y lectura ejecutiva.</div>",
+        "<div class='small-note'>Aquí metemos lo más “dashboard”: animación, comparador y lectura ejecutiva.</div>",
         unsafe_allow_html=True,
     )
 
-    # KPIs ejecutivos
     total_sales = df_f["sales"].sum() if "sales" in df_f.columns else None
     total_tx = df_f["transactions"].sum() if "transactions" in df_f.columns else None
     promo_share = (df_f["onpromotion"].gt(0).mean() * 100) if "onpromotion" in df_f.columns else None
@@ -664,16 +687,15 @@ with tab4:
     st.divider()
 
     # ------------------------------------------------------------
-    # IDEA 3) ANIMACIÓN: Top productos por año (Plotly animation)
+    # ANIMACIÓN (Idea 3): Top productos por año
     # ------------------------------------------------------------
     st.subheader("🎞️ Animación: Top productos por año")
     st.markdown(
-        "<div class='small-note'>Cómo leerlo: cada año (frame) muestra el ranking de familias por ventas. Es muy visual para ver cambios en el mix.</div>",
+        "<div class='small-note'>Cómo leerlo: cada año (frame) muestra el ranking de familias por ventas. Muy visual para ver cambios.</div>",
         unsafe_allow_html=True,
     )
 
     if all(col in df_f.columns for col in ["year", "family", "sales"]):
-        # Agrupamos por año+familia y rankeamos dentro de cada año (truco para quedarnos con Top 10 por frame)
         yfs = (
             df_f.groupby(["year", "family"], as_index=False)["sales"]
             .sum()
@@ -682,7 +704,6 @@ with tab4:
         yfs["rank"] = yfs.groupby("year")["sales"].rank(method="first", ascending=False)
         yfs_top = yfs[yfs["rank"] <= 10].copy()
 
-        # Para que el eje Y no sea caótico, limitamos a las familias que entran en algún top10
         fam_pool = yfs_top["family"].unique().tolist()
 
         fig = px.bar(
@@ -697,7 +718,6 @@ with tab4:
             color_discrete_sequence=[ACCENT_TURQ],
         )
         fig.update_xaxes(tickformat=".2s")
-        # Acelerar un pelín la animación (queda más “pro”)
         fig.update_layout(
             updatemenus=[
                 dict(
@@ -719,23 +739,21 @@ with tab4:
             ]
         )
         apply_plot_style(fig, x_title="Ventas", y_title="Producto (family)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("No hay columnas suficientes para animación (necesito year, family y sales).")
 
     st.divider()
 
     # ------------------------------------------------------------
-    # IDEA 9) Contexto: micro-narrativa + "qué mirar"
+    # Micro-insights (Idea 9)
     # ------------------------------------------------------------
-    st.subheader("📌 Lectura rápida (contexto)")
-    insights = []
-    if "sales" in df_f.columns:
-        # Pequeños insights “automáticos” (queda muy dashboard)
+    st.subheader("📌 Lectura rápida (insights automáticos)")
+    insights: list[str] = []
+
+    if "sales" in df_f.columns and df_f["sales"].sum() > 0:
         if "state" in df_f.columns:
-            state_share = (
-                df_f.groupby("state", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
-            )
+            state_share = df_f.groupby("state", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
             if len(state_share):
                 top_state = state_share.iloc[0]["state"]
                 share = (state_share.iloc[0]["sales"] / state_share["sales"].sum()) * 100
@@ -744,8 +762,7 @@ with tab4:
         if "onpromotion" in df_f.columns:
             promo_sales = df_f[df_f["onpromotion"] > 0]["sales"].sum()
             total = df_f["sales"].sum()
-            if total > 0:
-                insights.append(f"🏷️ Las ventas en promoción representan aprox. **{(promo_sales/total)*100:.1f}%** del total.")
+            insights.append(f"🏷️ Las ventas en promoción representan aprox. **{(promo_sales/total)*100:.1f}%** del total.")
 
     if insights:
         for it in insights:
@@ -756,7 +773,7 @@ with tab4:
     st.divider()
 
     # ------------------------------------------------------------
-    # IDEA 7) COMPARADOR (Store A vs Store B) EN TAB 4
+    # COMPARADOR (Idea 7): Tienda A vs Tienda B
     # ------------------------------------------------------------
     st.subheader("🆚 Comparador: Tienda A vs Tienda B")
     st.markdown(
@@ -766,36 +783,35 @@ with tab4:
 
     if "store_nbr" in df_f.columns:
         stores = sorted(df_f["store_nbr"].dropna().unique().tolist())
-        comp_col1, comp_col2 = st.columns(2)
-        with comp_col1:
+        col1, col2 = st.columns(2)
+        with col1:
             store_a = st.selectbox("Tienda A", stores, index=0)
-        with comp_col2:
-            # Intento elegir otra por defecto (si existe)
-            default_idx = 1 if len(stores) > 1 else 0
-            store_b = st.selectbox("Tienda B", stores, index=default_idx)
+        with col2:
+            store_b = st.selectbox("Tienda B", stores, index=1 if len(stores) > 1 else 0)
 
         a_df = df_f[df_f["store_nbr"] == store_a].copy()
         b_df = df_f[df_f["store_nbr"] == store_b].copy()
 
         # KPIs comparativos
         kA, kB, kC, kD = st.columns(4)
-
         a_sales = a_df["sales"].sum() if "sales" in a_df.columns else np.nan
         b_sales = b_df["sales"].sum() if "sales" in b_df.columns else np.nan
         a_promo = a_df["onpromotion"].gt(0).mean() * 100 if "onpromotion" in a_df.columns else np.nan
         b_promo = b_df["onpromotion"].gt(0).mean() * 100 if "onpromotion" in b_df.columns else np.nan
 
-        # Un delta sencillo hace que parezca más BI
-        kA.metric("Ventas Tienda A", fmt_short(a_sales), delta=None if np.isnan(a_sales) or np.isnan(b_sales) else fmt_short(a_sales - b_sales))
-        kB.metric("Ventas Tienda B", fmt_short(b_sales), delta=None if np.isnan(a_sales) or np.isnan(b_sales) else fmt_short(b_sales - a_sales))
+        # Un delta sencillo queda muy BI
+        delta_ab = None if (np.isnan(a_sales) or np.isnan(b_sales)) else fmt_short(a_sales - b_sales)
+        delta_ba = None if (np.isnan(a_sales) or np.isnan(b_sales)) else fmt_short(b_sales - a_sales)
+        kA.metric("Ventas Tienda A", fmt_short(a_sales), delta=delta_ab)
+        kB.metric("Ventas Tienda B", fmt_short(b_sales), delta=delta_ba)
         kC.metric("% promo A", "—" if np.isnan(a_promo) else f"{a_promo:.1f}%")
         kD.metric("% promo B", "—" if np.isnan(b_promo) else f"{b_promo:.1f}%")
 
-        # Evolución temporal comparada (mensual)
+        # Evolución mensual comparada
         if "date" in df_f.columns and "sales" in df_f.columns:
-            # Nota: agrupar por mes para que sea legible (en daily es demasiado ruido)
             a_m = a_df.dropna(subset=["date"]).copy()
             b_m = b_df.dropna(subset=["date"]).copy()
+
             a_m["month_period"] = a_m["date"].dt.to_period("M").astype(str)
             b_m["month_period"] = b_m["date"].dt.to_period("M").astype(str)
 
@@ -805,7 +821,12 @@ with tab4:
             series = a_series.merge(b_series, on="month_period", how="outer", suffixes=("_A", "_B")).fillna(0)
             series = series.sort_values("month_period")
 
-            series_long = series.melt("month_period", value_vars=["sales_A", "sales_B"], var_name="store", value_name="sales")
+            series_long = series.melt(
+                "month_period",
+                value_vars=["sales_A", "sales_B"],
+                var_name="store",
+                value_name="sales",
+            )
             series_long["store"] = series_long["store"].map({"sales_A": f"Tienda {store_a}", "sales_B": f"Tienda {store_b}"})
 
             fig = px.line(
@@ -819,13 +840,13 @@ with tab4:
             )
             fig.update_yaxes(tickformat=".2s")
             apply_plot_style(fig, x_title="Mes", y_title="Ventas")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
-        # Mix de productos (Top 5 por tienda)
+        # Mix top 5 productos
         if "family" in df_f.columns and "sales" in df_f.columns:
-            mix_col1, mix_col2 = st.columns(2)
+            m1, m2 = st.columns(2)
 
-            with mix_col1:
+            with m1:
                 top5_a = (
                     a_df.groupby("family", as_index=False)["sales"].sum()
                     .sort_values("sales", ascending=False)
@@ -843,9 +864,9 @@ with tab4:
                 fig.update_traces(texttemplate="%{text:.2s}", textposition="outside", cliponaxis=False)
                 fig.update_xaxes(tickformat=".2s")
                 apply_plot_style(fig, x_title="Ventas", y_title="Producto")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
-            with mix_col2:
+            with m2:
                 top5_b = (
                     b_df.groupby("family", as_index=False)["sales"].sum()
                     .sort_values("sales", ascending=False)
@@ -863,25 +884,22 @@ with tab4:
                 fig.update_traces(texttemplate="%{text:.2s}", textposition="outside", cliponaxis=False)
                 fig.update_xaxes(tickformat=".2s")
                 apply_plot_style(fig, x_title="Ventas", y_title="Producto")
-                st.plotly_chart(fig, use_container_width=True)
-
+                st.plotly_chart(fig, width="stretch")
     else:
         st.info("No hay columna store_nbr para construir el comparador.")
 
     st.divider()
 
     # ------------------------------------------------------------
-    # Extras visuales que ya tenías (pero con algo más de contexto)
+    # Extras (impacto promo + heatmap)
     # ------------------------------------------------------------
     st.subheader("Otros insights rápidos")
 
-    # Impacto promoción
     if "sales" in df_f.columns and "onpromotion" in df_f.columns:
         st.markdown(
             "<div class='small-note'>Cómo leerlo: compara ventas medias cuando hay promo vs cuando no (indicador de efectividad).</div>",
             unsafe_allow_html=True,
         )
-
         base = df_f.copy()
         base["promo_flag"] = np.where(base["onpromotion"] > 0, "Con promo", "Sin promo")
         promo_cmp = base.groupby("promo_flag", as_index=False)["sales"].mean()
@@ -898,15 +916,13 @@ with tab4:
         fig.update_traces(texttemplate="%{text:.2s}", textposition="outside", cliponaxis=False)
         fig.update_yaxes(tickformat=".2s")
         apply_plot_style(fig, x_title="", y_title="Ventas medias")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-    # Heatmap día semana vs mes
     if "day_of_week" in df_f.columns and "month" in df_f.columns and "sales" in df_f.columns:
         st.markdown(
             "<div class='small-note'>Cómo leerlo: zonas más intensas = combinaciones día/mes con ventas medias más altas.</div>",
             unsafe_allow_html=True,
         )
-
         order_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         df_h = df_f.copy()
         df_h["day_of_week"] = pd.Categorical(df_h["day_of_week"], categories=order_en, ordered=True)
@@ -914,38 +930,6 @@ with tab4:
         pivot = df_h.pivot_table(values="sales", index="day_of_week", columns="month", aggfunc="mean").fillna(0)
         fig = px.imshow(pivot, aspect="auto", title="Heatmap: ventas medias (día semana vs mes)")
         apply_plot_style(fig, x_title="Mes", y_title="Día de la semana")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-    # Festivos
-    if "holiday_type" in df_f.columns and "sales" in df_f.columns:
-        st.markdown(
-            "<div class='small-note'>Cómo leerlo: qué tipo de festivo se asocia a mayor venta media (si aplica en tu dataset).</div>",
-            unsafe_allow_html=True,
-        )
-
-        hol = df_f.copy()
-        hol["holiday_type"] = hol["holiday_type"].fillna("No holiday")
-        hol_cmp = (
-            hol.groupby("holiday_type", as_index=False)["sales"]
-            .mean()
-            .sort_values("sales", ascending=False)
-            .head(10)
-        )
-
-        fig = px.bar(
-            hol_cmp,
-            x="holiday_type",
-            y="sales",
-            title="Ventas medias por tipo de festivo (Top 10)",
-            color_discrete_sequence=[ACCENT_TURQ],
-            text="sales",
-        )
-        fig.update_traces(texttemplate="%{text:.2s}", textposition="outside", cliponaxis=False)
-        fig.update_yaxes(tickformat=".2s")
-        apply_plot_style(fig, x_title="Holiday type", y_title="Ventas medias")
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.info("💡 Si quieres aún más 'wow': se puede añadir un panel de alertas de outliers (días raros) o un selector global de métrica (ventas/transacciones).")
-
-
-
+    st.info("💡 Extra: si quieres todavía más “wow”, se puede añadir un panel de alertas de outliers (días raros).")
