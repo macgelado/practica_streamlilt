@@ -25,6 +25,9 @@ ACCENT_ORANGE = "#FFB168"
 ACCENT_DARK = "#0B1320"
 ACCENT_MID = "#1A2639"
 
+ZIP_URL_1 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_1.zip"
+ZIP_URL_2 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_2.zip"
+
 px.defaults.template = "plotly_white"
 px.defaults.color_discrete_sequence = [
     ACCENT_TURQ,
@@ -155,86 +158,82 @@ def apply_plot_style(fig, x_title=None, y_title=None):
 # LOAD DATA
 # ============================================================
 from pathlib import Path
+from io import BytesIO
 import zipfile
-import urllib.request
+import requests
 
 DATA_DIR = Path("data")
-CACHE_DIR = Path(".cache_data")
-CACHE_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
 
-ZIP_URL_1 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_1.zip"
-ZIP_URL_2 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_2.zip"
+@st.cache_data(show_spinner=True)
+def _download_and_extract_csv(zip_url: str, out_csv_name: str) -> Path:
+    """
+    Descarga un ZIP desde GitHub Releases y extrae el primer CSV que encuentre.
+    Devuelve la ruta local del CSV extraído.
+    """
+    out_csv = DATA_DIR / out_csv_name
+    if out_csv.exists():
+        return out_csv
 
-def _download(url: str, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, out_path)
+    # Descarga robusta (GitHub a veces redirige)
+    r = requests.get(zip_url, allow_redirects=True, timeout=180)
+    r.raise_for_status()
 
-def _extract_first_csv(zip_path: Path, out_dir: Path, final_name: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as z:
-        csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
-        if not csvs:
-            raise ValueError(f"No hay CSV dentro de {zip_path.name}")
-        target = csvs[0]
-        z.extract(target, out_dir)
+    with zipfile.ZipFile(BytesIO(r.content)) as z:
+        csv_members = [m for m in z.namelist() if m.lower().endswith(".csv")]
+        if not csv_members:
+            raise ValueError(f"No hay ningún CSV dentro del ZIP: {zip_url}")
+        member = csv_members[0]
 
-    extracted = out_dir / target
-    final_path = out_dir / final_name
-    if extracted != final_path:
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        extracted.replace(final_path)
-    return final_path
+        with z.open(member) as f_in, open(out_csv, "wb") as f_out:
+            f_out.write(f_in.read())
 
-@st.cache_data
+    return out_csv
+
+
+@st.cache_data(show_spinner=True)
 def load_data():
     """
-    Si estás en local y existen data/parte_1.csv y data/parte_2.csv -> los usa.
-    Si NO existen (Streamlit Cloud) -> descarga los zips desde GitHub Releases, extrae y lee.
+    Carga datos desde los ZIP de Releases (v1), prepara tipos y columnas derivadas.
     """
-    local_csv1 = DATA_DIR / "parte_1.csv"
-    local_csv2 = DATA_DIR / "parte_2.csv"
+    # Mensajes de “debug” para Streamlit Cloud (se ven en la app)
+    st.info("📥 Descargando y extrayendo datos desde GitHub Releases...")
 
-    if local_csv1.exists() and local_csv2.exists():
-        df1 = pd.read_csv(local_csv1)
-        df2 = pd.read_csv(local_csv2)
-    else:
-        st.info("📦 Descargando datos desde GitHub Releases...")
+    csv1 = _download_and_extract_csv(ZIP_URL_1, "parte_1.csv")
+    st.success(f"✅ Extraído: {csv1}")
 
-        zip1 = CACHE_DIR / "parte_1.zip"
-        zip2 = CACHE_DIR / "parte_2.zip"
+    csv2 = _download_and_extract_csv(ZIP_URL_2, "parte_2.csv")
+    st.success(f"✅ Extraído: {csv2}")
 
-        if not zip1.exists():
-            _download(ZIP_URL_1, zip1)
-        if not zip2.exists():
-            _download(ZIP_URL_2, zip2)
+    st.info("📄 Leyendo CSVs (esto puede tardar un poco)...")
 
-        csv1 = _extract_first_csv(zip1, CACHE_DIR, "parte_1.csv")
-        csv2 = _extract_first_csv(zip2, CACHE_DIR, "parte_2.csv")
+    df1 = pd.read_csv(csv1, low_memory=False)
+    df2 = pd.read_csv(csv2, low_memory=False)
 
-        df1 = pd.read_csv(csv1)
-        df2 = pd.read_csv(csv2)
-
-    # A partir de aquí tu lógica igual
+    # Si tienen mismas columnas -> concat
     if set(df1.columns) == set(df2.columns):
         df = pd.concat([df1, df2], ignore_index=True)
     else:
         common_cols = list(set(df1.columns).intersection(set(df2.columns)))
-        if len(common_cols) > 0:
+        if common_cols:
             df = pd.concat([df1[common_cols], df2[common_cols]], ignore_index=True)
-            st.warning("⚠️ He concatenado solo las columnas comunes.")
         else:
-            st.error("❌ No hay columnas comunes entre parte_1 y parte_2.")
-            return None
+            raise ValueError("No hay columnas comunes entre parte_1 y parte_2.")
 
+    # Tipos básicos
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
     if "sales" in df.columns:
         df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0)
+
     if "onpromotion" in df.columns:
         df["onpromotion"] = pd.to_numeric(df["onpromotion"], errors="coerce").fillna(0).astype(int)
+
     if "transactions" in df.columns:
         df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce").fillna(0)
 
+    # Derivadas
     if "date" in df.columns and df["date"].notna().any():
         if "year" not in df.columns:
             df["year"] = df["date"].dt.year
@@ -245,7 +244,9 @@ def load_data():
         if "day_of_week" not in df.columns:
             df["day_of_week"] = df["date"].dt.day_name()
 
+    st.success("✅ Datos cargados correctamente.")
     return df
+
 
 
 df = load_data()
@@ -945,5 +946,6 @@ with tab4:
         st.plotly_chart(fig, use_container_width=True)
 
     st.info("💡 Si quieres aún más 'wow': se puede añadir un panel de alertas de outliers (días raros) o un selector global de métrica (ventas/transacciones).")
+
 
 
