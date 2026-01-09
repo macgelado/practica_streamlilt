@@ -154,42 +154,87 @@ def apply_plot_style(fig, x_title=None, y_title=None):
 # ============================================================
 # LOAD DATA
 # ============================================================
+from pathlib import Path
+import zipfile
+import urllib.request
+
+DATA_DIR = Path("data")
+CACHE_DIR = Path(".cache_data")
+CACHE_DIR.mkdir(exist_ok=True)
+
+ZIP_URL_1 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_1.zip"
+ZIP_URL_2 = "https://github.com/macgelado/practica_streamlilt/releases/download/v1/parte_2.zip"
+
+def _download(url: str, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(url, out_path)
+
+def _extract_first_csv(zip_path: Path, out_dir: Path, final_name: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
+        if not csvs:
+            raise ValueError(f"No hay CSV dentro de {zip_path.name}")
+        target = csvs[0]
+        z.extract(target, out_dir)
+
+    extracted = out_dir / target
+    final_path = out_dir / final_name
+    if extracted != final_path:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        extracted.replace(final_path)
+    return final_path
+
 @st.cache_data
 def load_data():
-    """Carga los CSV y prepara tipos/columnas derivadas."""
-    df1 = pd.read_csv("data/parte_1.csv")
-    df2 = pd.read_csv("data/parte_2.csv")
+    """
+    Si estás en local y existen data/parte_1.csv y data/parte_2.csv -> los usa.
+    Si NO existen (Streamlit Cloud) -> descarga los zips desde GitHub Releases, extrae y lee.
+    """
+    local_csv1 = DATA_DIR / "parte_1.csv"
+    local_csv2 = DATA_DIR / "parte_2.csv"
 
-    # Truco: si son iguales -> concat directo. Si no, intentamos con columnas comunes.
+    if local_csv1.exists() and local_csv2.exists():
+        df1 = pd.read_csv(local_csv1)
+        df2 = pd.read_csv(local_csv2)
+    else:
+        st.info("📦 Descargando datos desde GitHub Releases...")
+
+        zip1 = CACHE_DIR / "parte_1.zip"
+        zip2 = CACHE_DIR / "parte_2.zip"
+
+        if not zip1.exists():
+            _download(ZIP_URL_1, zip1)
+        if not zip2.exists():
+            _download(ZIP_URL_2, zip2)
+
+        csv1 = _extract_first_csv(zip1, CACHE_DIR, "parte_1.csv")
+        csv2 = _extract_first_csv(zip2, CACHE_DIR, "parte_2.csv")
+
+        df1 = pd.read_csv(csv1)
+        df2 = pd.read_csv(csv2)
+
+    # A partir de aquí tu lógica igual
     if set(df1.columns) == set(df2.columns):
         df = pd.concat([df1, df2], ignore_index=True)
     else:
         common_cols = list(set(df1.columns).intersection(set(df2.columns)))
         if len(common_cols) > 0:
             df = pd.concat([df1[common_cols], df2[common_cols]], ignore_index=True)
-            st.warning(
-                "⚠️ parte_1 y parte_2 NO tienen las mismas columnas. "
-                "He concatenado solo las columnas comunes. "
-                "Si faltan columnas requeridas, habría que hacer merge."
-            )
+            st.warning("⚠️ He concatenado solo las columnas comunes.")
         else:
-            st.error("❌ No hay columnas comunes entre parte_1 y parte_2. Revisa los ficheros.")
+            st.error("❌ No hay columnas comunes entre parte_1 y parte_2.")
             return None
 
-    # Tipos
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
     if "sales" in df.columns:
         df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0)
-
     if "onpromotion" in df.columns:
         df["onpromotion"] = pd.to_numeric(df["onpromotion"], errors="coerce").fillna(0).astype(int)
-
     if "transactions" in df.columns:
         df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce").fillna(0)
 
-    # Derivadas (por si el CSV no las trae ya)
     if "date" in df.columns and df["date"].notna().any():
         if "year" not in df.columns:
             df["year"] = df["date"].dt.year
@@ -900,3 +945,4 @@ with tab4:
         st.plotly_chart(fig, use_container_width=True)
 
     st.info("💡 Si quieres aún más 'wow': se puede añadir un panel de alertas de outliers (días raros) o un selector global de métrica (ventas/transacciones).")
+
