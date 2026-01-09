@@ -946,3 +946,4 @@ with tab4:
 
     st.info("💡 Si quieres aún más 'wow': se puede añadir un panel de alertas de outliers (días raros) o un selector global de métrica (ventas/transacciones).")
 
+
